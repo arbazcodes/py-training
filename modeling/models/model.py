@@ -1,16 +1,12 @@
 from typing import List, Dict
-
 import torch
 from torch import nn
 
 from modeling.models.modules.EventEncoder import EventEncoder
 from modeling.models.modules.EventPredictor import EventPredictor
 
-
-def causal_attention_mask(seq_len: int) -> torch.Tensor:
-    mask = torch.triu(torch.ones((seq_len, seq_len)), diagonal=1).bool()
-    return mask
-
+def causal_mask(sz: int) -> torch.Tensor:
+    return torch.triu(torch.ones(sz, sz), diagonal=1).bool()
 
 class Model(nn.Module):
     def __init__(
@@ -24,13 +20,11 @@ class Model(nn.Module):
         encoders: List[str],
         d_output: int
     ):
-        super(Model, self).__init__()
-        self.event_embedder = EventEncoder(d_categories, d_model)
+        super().__init__()
+        self.embedder = EventEncoder(d_categories, d_model)
 
-        # build one TransformerEncoder per stream name
-        encoder_modules = {}
-        for encoder in encoders:
-            encoder_modules[encoder] = nn.TransformerEncoder(
+        self.encoders = nn.ModuleDict({
+            name: nn.TransformerEncoder(
                 nn.TransformerEncoderLayer(
                     d_model=d_model,
                     nhead=n_heads,
@@ -39,131 +33,59 @@ class Model(nn.Module):
                 ),
                 num_layers=encoder_layers
             )
-        self.encoders_dict = nn.ModuleDict(encoder_modules)
+            for name in encoders
+        })
 
-        self.event_predictor = EventPredictor(
+        self.predictor = EventPredictor(
             d_categories=d_categories,
-            d_facts=d_output,
             d_input=d_input,
+            d_facts=d_output,
             d_model=d_model,
             num_heads=n_heads,
             decoder_layers=decoder_layers
         )
 
-    def forward(
-        self,
-        src_events: Dict[str, List[torch.Tensor]],
-        tgt_events: torch.Tensor,
-        encodings_to_carry: int
-    ) -> List[torch.Tensor]:
-        """
-        src_events: {
-            stream_name: [ Tensor(batch, seq, cats), ... ],
-            ...
-        }
-        tgt_events: Tensor(batch, tgt_seq, cats)
-        """
-        # 1) Encode each stream, collect the *last* encodings_to_carry tokens
-        encoder_outputs = []
-        for stream_name, stream_list in src_events.items():
-            # stream_list is e.g. [ tensor(batch, seq, cats), tensor(batch, seq, cats) ]
-            for seq in stream_list:
-                # embed + positional
-                emb = self.event_embedder(seq)             # [b, seq, d_model]
-                encoded = self.encoders_dict[stream_name](emb)  # [b, seq, d_model]
-                # take last encodings_to_carry tokens
-                encoder_outputs.append(encoded[:, -encodings_to_carry:, :])
+    def forward(self, src_events: Dict[str, List[torch.Tensor]], tgt_events: torch.Tensor, carry: int):
+        enc_outs = []
+        for name, seq_list in src_events.items():
+            for seq in seq_list:
+                emb = self.embedder(seq)              # [1, src_seq, d_model]
+                out = self.encoders[name](emb)        # [1, src_seq, d_model]
+                enc_outs.append(out[:, -carry:, :])    # take last `carry` tokens
+        memory = torch.cat(enc_outs, dim=1)         # [1, total_carry, d_model]
 
-        # concat along time dimension → memory
-        memory = torch.cat(encoder_outputs, dim=1)  # [b, total_streams * encodings_to_carry, d_model]
+        tgt_emb = self.embedder(tgt_events)        # [1, tgt_seq, d_model]
+        m = causal_mask(tgt_emb.size(1)).to(tgt_emb.device)
 
-        # 2) Prepare target embeddings + causal mask
-        embedded_target = self.event_embedder(tgt_events)   # [b, tgt_seq, d_model]
-        seq_len = embedded_target.size(1)
-        causal_mask = causal_attention_mask(seq_len).to(embedded_target.device)
-
-        # 3) Predict next events
-        return self.event_predictor(
-            tgt=embedded_target,
-            memory=memory,
-            tgt_mask=causal_mask
-        )
-
+        return self.predictor(tgt_emb, memory, tgt_mask=m)
 
 class ModelTrainer(nn.Module):
-    def __init__(
-        self,
-        d_input: int,
-        d_model: int,
-        n_heads: int,
-        encoder_layers: int,
-        decoder_layers: int,
-        d_categories: List[int],
-        encoders: List[str],
-        d_output: int
-    ):
-        super(ModelTrainer, self).__init__()
-        self.model = Model(
-            d_input=d_input,
-            d_model=d_model,
-            n_heads=n_heads,
-            encoder_layers=encoder_layers,
-            decoder_layers=decoder_layers,
-            d_categories=d_categories,
-            encoders=encoders,
-            d_output=d_output
-        )
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.model = Model(**kwargs)
 
-    def forward(
-        self,
-        batch_src_events: List[Dict[str, List[torch.Tensor]]],
-        batch_tgt_events: List[torch.Tensor],
-        batch_masks: List[List[torch.Tensor]],
-        cross_encoder_token_length: int = 1,
-        run_backward: bool = False,
-    ):
-        loss_sum = 0.0
-        per_category_loss = {}
+    def forward(self, batch_src, batch_tgt, batch_mask, carry=1, run_backward=False):
+        total_loss = 0.0
+        cat_losses = {}
 
-        for i in range(len(batch_tgt_events)):
-            # prepare one minibatch
-            src_events = batch_src_events[i]
-            tgt_events = batch_tgt_events[i].to(dtype=torch.int64).unsqueeze(0)  # [1, tgt_seq, cats]
-            masks = batch_masks[i]  # list of [ Tensor(cat_size), ... ]
+        for src, tgt, mask in zip(batch_src, batch_tgt, batch_mask):
 
-            # move src to correct dtype/device
-            for stream_name in src_events:
-                for j, seq in enumerate(src_events[stream_name]):
-                    src_events[stream_name][j] = seq.to(dtype=torch.int64)
-
-            # run forward
-            preds = self.model(
-                src_events,
-                tgt_events[:, :-1, :],
-                cross_encoder_token_length
-            )
-
-            # compute category losses
-            cat_losses = []
-            for cat_idx, logits in enumerate(preds):
-                # logits: [1, seq, vocab_size]
-                # mask out invalid positions
-                mask_tensor = masks[cat_idx].to(logits.dtype).to(logits.device)  # [vocab_size]
-                logits = logits + mask_tensor
-
-                target = tgt_events[:, 1:, cat_idx].reshape(-1)
+            preds = self.model(src, tgt[:, :-1, :], carry)
+            losses = []
+            for i, logits in enumerate(preds):
+                # apply per‐category mask
+                logits = logits + mask[i].to(logits.device)
+                tgt_i = tgt[:, 1:, i].reshape(-1)
                 logits_flat = logits.reshape(-1, logits.size(-1))
-                loss = nn.functional.cross_entropy(logits_flat, target)
-                cat_losses.append(loss)
+                loss = nn.functional.cross_entropy(logits_flat, tgt_i)
+                losses.append(loss)
+                cat_losses[i] = cat_losses.get(i, 0.0) + loss.item()
 
-                per_category_loss.setdefault(cat_idx, 0.0)
-                per_category_loss[cat_idx] += loss.item()
-
-            batch_loss = torch.stack(cat_losses).mean()
+            batch_loss = torch.stack(losses).mean()
             if run_backward:
                 batch_loss.backward()
-            loss_sum += batch_loss.item()
+            total_loss += batch_loss.item()
 
-        avg_loss = loss_sum / len(batch_tgt_events)
-        avg_per_cat = [per_category_loss[i] / len(batch_tgt_events) for i in sorted(per_category_loss)]
+        avg_loss = total_loss / len(batch_tgt)
+        avg_per_cat = [v / len(batch_tgt) for i, v in sorted(cat_losses.items())]
         return avg_loss, avg_per_cat

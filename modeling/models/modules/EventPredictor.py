@@ -1,8 +1,6 @@
 from typing import List
-
 import torch
 from torch import nn
-
 
 class EventPredictor(nn.Module):
     def __init__(
@@ -14,8 +12,7 @@ class EventPredictor(nn.Module):
         num_heads: int,
         decoder_layers: int
     ):
-        super(EventPredictor, self).__init__()
-
+        super().__init__()
         self.predictor = nn.ModuleList([
             nn.TransformerDecoderLayer(
                 d_model=d_model,
@@ -23,39 +20,18 @@ class EventPredictor(nn.Module):
                 batch_first=True,
                 norm_first=True,
                 activation=nn.Mish()
-            ) for _ in range(decoder_layers)
+            )
+            for _ in range(decoder_layers)
         ])
 
-        self.fact_projection = nn.Linear(d_model, d_facts)
-        modules = []
-        for d_category in d_categories:
-            modules.append(nn.Linear(d_model, d_category))
-        self.categorical_projections = nn.ModuleList(modules)
-        self.output_projection = nn.Linear(d_model, d_input)
+        self.fact_proj = nn.Linear(d_model, d_facts)
+        self.cat_heads = nn.ModuleList([
+            nn.Linear(d_model, c) for c in d_categories
+        ])
+        self.out_proj = nn.Linear(d_model, d_input)
 
-    def forward(
-        self,
-        tgt: torch.Tensor,
-        memory: torch.Tensor,
-        tgt_mask: torch.Tensor = None
-    ) -> List[torch.Tensor]:
-        """
-        Args:
-            tgt:    [batch_size, seq_len, d_model]
-            memory: [batch_size, mem_len, d_model]
-            tgt_mask: [seq_len, seq_len]
-        """
-        y_e = tgt
+    def forward(self, tgt, memory, tgt_mask=None):
+        x = tgt
         for layer in self.predictor:
-            y_e = layer(
-                tgt=y_e,
-                memory=memory,
-                tgt_mask=tgt_mask,
-                tgt_is_causal=True
-            )
-
-        category_predictions = []
-        for output in self.categorical_projections:
-            category_predictions.append(output(y_e))
-
-        return category_predictions
+            x = layer(tgt=x, memory=memory, tgt_mask=tgt_mask, tgt_is_causal=True)
+        return [head(x) for head in self.cat_heads]
